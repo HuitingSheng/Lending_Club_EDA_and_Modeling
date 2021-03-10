@@ -17,7 +17,7 @@ Based on the goal, we will only focus on the records with loan status Fully Paid
 
 # Reading in the data
 ```{r Load_data, cache=TRUE}
-setwd("/Users/huitingsheng/Downloads/Github/Lending_Club_new")
+setwd("/Users/huitingsheng/Downloads/Github/Lending_Club_EDA_and_Modeling")
 data1 = read.csv("LoanStats_securev1_2019Q3.csv")
 data2 = read.csv("LoanStats_securev1_2019Q4.csv")
 data3 = read.csv("LoanStats_securev1_2020Q1.csv")
