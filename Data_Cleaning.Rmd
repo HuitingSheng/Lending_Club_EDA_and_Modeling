@@ -1,0 +1,591 @@
+---
+title: "Lending_club"
+author: "Huiting Sheng"
+date: "12/7/2020"
+output: html_document
+---
+
+
+# Introduction
+Lending Club is a US peer-to-peer lending company and the world's largest peer-to-peer lending platform. As explained by [Wikipedia](https://en.wikipedia.org/wiki/LendingClub).   
+
+The goal of this Project is using the data from Lending club (2019Q3 to 2020Q2), conducting as set of explorator analysis and applying multiple machine learning algorithm techniques to predict the customer default rate.   
+
+Data files contain complete loan data for all loans issued through the time period stated, including the current loan status (Current, Late, Fully Paid, etc.) and latest payment information.   
+Based on the goal, we will only focus on the records with loan status Fully Paid, Charged off, Default and Late. We will remove the records that not in these status. and group Charged off, Default and Late into one call Default.
+
+
+# Reading in the data
+```{r Load_data, cache=TRUE}
+setwd("/Users/huitingsheng/Downloads/Github/Lending_Club_new")
+data1 = read.csv("LoanStats_securev1_2019Q3.csv")
+data2 = read.csv("LoanStats_securev1_2019Q4.csv")
+data3 = read.csv("LoanStats_securev1_2020Q1.csv")
+data4 = read.csv("LoanStats_securev1_2020Q2.csv")
+data = rbind(data1,data2,data3, data4)
+dim(data)
+
+```
+
+# Installing/Loading Packages
+```{r Load_package, message=F}
+packages=c("caret","ggplot2", "tidyverse", "dplyr", "corrplot","e1071", "reshape2","lubridate","usmap", "glmnet", "pROC","doParallel", "ranger","lattice","gridExtra", "kableExtra", "ROSE", "DMwR")
+# Now load or install & load all
+package.check <- lapply(packages,FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+```
+
+## Remove all records that loan Status is Current and Issued
+Our goal is the predict the default rate of customers,so before we move forward to clean up the data. Let's combine loan status. We only want records that either fully paid, or default, charged off,or late. Default, Charged off and Late are consider as Risky Customer that we want to prevent.  
+As we don't know whether the current customer and issued customer will be fully paid or turn into charged off. so we remove all the current and issued records.and combine Default, Charged off and Late into a group called Charged_off    
+
+```{r group_loan_status, cache=T}
+df = data
+as.data.frame(table(df$loan_status))
+ggplot(data=df,aes(y=loan_status)) + geom_bar()
+
+# remove all current records
+df = df %>%
+  filter(loan_status !="Current" & loan_status !="Issued" & loan_status !="") %>% 
+  mutate(loan_status = if_else(loan_status %in% 
+                        c("Fully Paid"," Does not meet the credit policy. Status:Fully Paid "), 
+                        "Fully_Paid","Charged_off"))
+
+as.data.frame(table(df$loan_status))
+
+```
+
+Charged_off and Fully_paid is unbalanced. Will use down sampling while build models. 
+
+## Combining Application type
+There are two types of application type, individual and joint. But there are only 10% application is joint application. I want to transform related features before formal data cleansing, in case all join application info get drop off.  
+```{r combine_application_type,cache =T}
+df = df %>% 
+  mutate(annual_inc = ifelse(application_type == "Joint App",annual_inc_joint,annual_inc), 
+         dti = ifelse(application_type == "Joint App", dti_joint,dti),
+         verification_status = ifelse(application_type == "Joint App",
+                                      verification_status_joint,verification_status)) %>%
+  select(-c(annual_inc_joint,dti_joint,verification_status_joint))
+
+```
+
+## drop columns that have no variance or low variance
+No Variance, and low variance features don't bring any useful info to us model. so we are going to drop them.  
+```{r drop_nzv, cache = T}
+nzv = colnames(df)[nearZeroVar(df, allowParallel = TRUE)]
+cat("Zero or low Variance Columns are: \n", nzv)
+data_wo_nzv = df %>% select(-all_of(nzv)) # drop no and low variance features
+```
+
+We have dropped `r length(nzv)` features. 
+
+## Drop features missing more than 50% data
+
+A feature missing more than 50%, then we want to drop them, as it does not bring extra info to our model. 
+
+```{r drop_missing_na, cache=T}
+# checking fraction of missing value for each feature
+fraction=c()
+per = c()
+# check every columns that missing data is above 50%
+for(i in 1:dim(data_wo_nzv)[2]){
+  temp = sum(is.na(data_wo_nzv[,i]))
+  perc = temp/dim(data_wo_nzv)[1]
+  per = append(per, perc)
+  fraction=rbind(fraction,c(colnames(data_wo_nzv)[i], temp, perc))
+}
+fraction = as.data.frame(fraction)
+colnames(fraction)=c("name","count","missing_fraction")
+fraction%>%kbl() %>% kable_styling( font_size = 12) %>%scroll_box(width = "100%", height="300px", fixed_thead=T )
+
+# Histogram of Feature Incompleteness
+hist(per, main="Histogram of Feature Incompleteness", xlab="missing fraction")
+
+# drop columns that missing more than 50% record
+data_drop = data_wo_nzv %>% select (-colnames(data_wo_nzv)[per>0.5])
+cat("drop columns are:\n", colnames(data_wo_nzv)[per>0.5])
+
+```
+
+We have dropped another`r length(colnames(data_wo_nzv)[per>0.5])` features.
+
+## drop columns that don't need 
+We want to remove noise features, like url, desc, etc.  Also, We want to focus on the information that customers provide to Lending club when they apply the loan to predict the default. We will ignore all features that generated after the loan is approved.  
+
+```{r columns_needed, cache=T}
+# check current data before futhur feature selection
+data_drop[1:10,] %>% kbl() %>% kable_styling( font_size = 12) %>%scroll_box(width = "100%", height="300px", fixed_thead=T )
+
+columns_keep = c('loan_amnt','term','sub_grade',"int_rate",'emp_length','home_ownership','annual_inc','verification_status','purpose','addr_state','dti','delinq_2yrs','earliest_cr_line','fico_range_low','fico_range_high', "inq_last_6mths", 'open_acc','pub_rec','total_acc',"initial_list_status","application_type","all_util","bc_util",'revol_util','mort_acc', 'num_accts_ever_120_pd', "percent_bc_gt_75", 'pub_rec_bankruptcies',"num_tl_op_past_12m","num_actv_rev_tl",'loan_status')  
+
+LC = data_drop %>%select(all_of(columns_keep))
+col_drops = data_drop %>%select(-all_of(columns_keep))%>%colnames
+cat("columns that droped: \n", col_drops)
+
+# remaining features
+LC[1:10,] %>% kbl() %>% kable_styling( font_size = 12) %>%scroll_box(width = "100%", height="300px", fixed_thead=T )
+
+```
+
+
+## cleaning data with NA 
+
+```{r drop_na, cache =T}
+# check missing data again
+fraction=c()
+for(i in 1:dim(LC)[2]){
+  temp = sum(is.na(LC[,i]))
+  perc = temp/dim(LC)[1]
+  fraction=rbind(fraction,c(colnames(LC)[i], temp, perc))
+}
+fraction = as.data.frame(fraction)
+colnames(fraction)=c("name","count","missing_fraction")
+fraction%>%kbl() %>% kable_styling( font_size = 12) %>%scroll_box(width = "100%", height="300px", fixed_thead=T )
+
+# As we have 55671 rows,  we can just drop all records with missing value 
+LC = LC%>%drop_na
+as.data.frame(table(LC$loan_status))
+
+
+```
+
+## data transformation 
+earliest_cr_line is the month the borrower's earliest reported credit line was opened. we want to convert it to a numeric value that show how many years that the borrower own credit line since the first one is opened. 
+```{r}
+# convert the earliest_cr_line to credit history in year
+convert_year <- function(x, year=1940){
+  m <- year(x) %% 100
+  year(x) <- ifelse(m > year %% 100, 1900+m, 2000+m)
+  x
+}
+
+LC = LC%>%mutate(cr_year = earliest_cr_line %>% 
+                                         paste0("01-",.) %>%
+                                         as.Date(format="%d-%B-%y") %>% 
+                                         convert_year () %>% 
+                                         difftime(Sys.Date(), .) %>% 
+                                         time_length("years") %>%
+                                         round(0)) %>% select (-earliest_cr_line)
+```
+
+take the average of fico score high and low. 
+```{r}
+# average fico score high and low and assign it to fico_score
+LC = LC %>% mutate(fico_score = 0.5*fico_range_low +0.5*fico_range_high) %>%
+                   select(-c(fico_range_low,fico_range_high))
+```
+
+correct the data type
+```{r}
+table(sapply(LC[1,], class))
+cat("Character columns: ", LC %>% select_if(is.character) %>% colnames, "\n")
+# Convert loan_status to Factor
+LC$loan_status = as.factor(LC$loan_status)
+cat("Factor columns: ", LC %>% select_if(is.factor )%>% colnames, "\n")
+# Convert int_rate should to Numeric
+LC$int_rate = as.numeric(sub("%","",LC$int_rate))/100
+
+# Convert revol_util should to Numeric
+LC$revol_util = as.numeric(sub("%","",LC$revol_util))/100
+
+# substract year from emp_length
+LC$emp_length = sub("years","",LC$emp_length)
+LC$emp_length = as.factor(sub("year","",LC$emp_length))
+
+cat("Numeric columns: ", LC %>% select_if(is.numeric) %>% colnames,"\n")
+
+# Convert Verification status to Factor
+LC$verification_status = as.factor(LC$verification_status)
+
+# Convert dti, all_util, bc_util, percent_bc_gt_75 into decimal
+LC$dti = LC$dti/100
+LC$all_util = LC$all_util/100
+LC$bc_util = LC$bc_util/100
+LC$percent_bc_gt_75 = LC$percent_bc_gt_75/100
+```
+
+Checking the data type again after converting.
+```{r}
+# Check the class type after convert 
+table(sapply(LC[1,], class))
+
+# check any n/a value 
+anyNA(LC)
+```
+
+
+# Exploratory Data  Analysis (EDA)
+
+
+## Factors 
+```{r}
+# term
+term_bar = ggplot(data=LC, aes(x = term, fill= loan_status))+geom_bar( position = 'fill') #+ theme(legend.position = "top")
+
+# sub_grade
+Subgrade_bar = ggplot(data=LC, aes(x = sub_grade, fill= loan_status))+geom_bar(position = "fill")# + theme(legend.position = "top")
+
+# emp_length
+emp_length_bar = ggplot(data=LC, aes(y = emp_length, fill= loan_status))+geom_bar(position = "fill") + theme(legend.position = "top")
+
+# home ownership
+home_ownership_bar = ggplot(data=LC, aes(y = home_ownership, fill= loan_status))+geom_bar(position = "fill") #+ theme(legend.position = "top")
+
+# verifcation_status
+verification_status_bar = ggplot(data=LC, aes(x = verification_status, fill= loan_status))+geom_bar(position = "fill") #+ theme(legend.position = "top")
+
+#purpose
+purpose_bar = ggplot(data=LC, aes(y = purpose, fill= loan_status))+geom_bar(position = "fill")  + theme(legend.position = "top")
+
+# initial_list_status
+initial_list_status_bar = ggplot(data=LC, aes(x = initial_list_status, fill= loan_status))+geom_bar(position = "fill") #+ theme(legend.position = "top")
+
+# application_type
+application_type_bar = ggplot(data=LC, aes(x = application_type, fill= loan_status))+geom_bar(position = "fill") #+ theme(legend.position = "top")
+
+
+figure.1 <- grid.arrange(term_bar, verification_status_bar,home_ownership_bar,initial_list_status_bar,application_type_bar,ncol =2) 
+figure.2 <- grid.arrange(Subgrade_bar,  ncol = 1)
+figure.3 <- grid.arrange( emp_length_bar,purpose_bar,  ncol = 1)
+```
+
+Charge off Rate by state.
+```{r cache = TRUE, message=F}
+# bar plot  based on addr_state
+ggplot(data = LC, aes(y=addr_state, fill=loan_status)) + geom_bar(position="fill")
+# Group the state and calculate the percentage of the default loan in each state
+summary <- LC %>%
+  group_by(addr_state) %>%
+  summarise(percentage = (sum(loan_status == "Charged_off")/(sum(loan_status == "Charged_off")+sum(loan_status == "Fully_Paid"))))
+
+summary = summary[c(2,1,3:50),]
+
+
+
+library(usmap)
+
+summary$full = summary$addr_state
+summary$full = as.factor(summary$full)
+levels(summary$full) = c("","Alaska","Alabama","Arkansas", "Arizona", "California","Colorado","Connecticut","District of Columbia","Delaware","Florida","Georgia","Hawaii","Iowa","Idaho","Illinois","Indiana","Kansas","Kentucky","Louisiana","Massachusetts","Maryland","Maine","Michigan","Minnesota","Missouri","Mississippi","Montana","North Carolina","Nebraska","New Hampshire","New Jersey","New Mexico","Nevada","New York","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah","Virginia","Vermont","Washington","Wisconsin","West Virginia","Wyoming","")
+us_states = usmap::us_map("state")
+
+loanstatusperstate = merge(us_states, summary, by="full")[,c(8,11)]
+
+plot_usmap(data=loanstatusperstate, labels = TRUE, values="percentage") + theme(legend.position = "right") + scale_fill_continuous(name = "Default Loan Percentage") + labs(title = "Default Loan Percentage by States")
+```
+
+check the relationship between purpose and loan_amnt   
+```{r}
+# check the relationship between purpose and loan_amnt
+purpose_box=ggplot(data=LC, aes( y=purpose, x=loan_amnt,fill=loan_status)) + geom_boxplot()
+figure.purpose <- grid.arrange( purpose_bar,purpose_box,  ncol = 1)
+```
+
+checking the correlation between_grade and int_rate   
+```{r}
+# checking the correlation between_grade and int_rate
+ggplot(data=LC, aes( y=sub_grade, x=int_rate,)) + geom_boxplot()
+
+# remove the outliers at D1 and D2 with interest rate lower than 0.1
+LC = LC[!(LC$sub_grade%in% c("D1","D2") & LC$int_rate < 0.1),]
+
+
+table(LC$emp_length)
+```
+
+initial_list_status have low relationship to loan status, we can drop this features.    
+grade has linear relation to the loan status, I will convert it to numeric 1-20, A1 is the highest 20, D5 is lowest 1.   
+I also convert the employment length into numeric    
+
+
+## Drop andTransform factor features
+```{r}
+# drop initial_list_status
+LC = LC %>% select(-c(initial_list_status))
+
+LC.data = LC %>% mutate(sub_grade = case_when(sub_grade == "A1" ~ 20,
+                                     sub_grade == "A2" ~ 19,
+                                     sub_grade == "A3" ~ 18,
+                                     sub_grade == "A4" ~ 17,
+                                     sub_grade == "A5" ~ 16,
+                                     sub_grade == "B1" ~ 15,
+                                     sub_grade == "B2" ~ 14,
+                                     sub_grade == "B3" ~ 13,
+                                     sub_grade == "B4" ~ 12,
+                                     sub_grade == "B5" ~ 11,
+                                     sub_grade == "C1" ~ 10,
+                                     sub_grade == "C2" ~ 9,
+                                     sub_grade == "C3" ~ 8,
+                                     sub_grade == "C4" ~ 7,
+                                     sub_grade == "C5" ~ 6,
+                                     sub_grade == "D1" ~ 5,
+                                     sub_grade == "D2" ~ 4,
+                                     sub_grade == "D3" ~ 3,
+                                     sub_grade == "D4" ~ 2,
+                                     sub_grade == "D5" ~ 1,
+                                     ),
+                   #purpose = as.factor(case_when(purpose %in% c("credit_card", "debt_consolidation", "small_business") ~ "Finance",
+                  #                     purpose %in% c("home_improvement", "house") ~ "house_related",
+                   #                    purpose %in% c("renewable_energy", "medical","moving") ~ "house_related",
+                    #                   purpose %in% c("car", "vacation","other", "major_purchase") ~ "other"
+                     #                  )),
+                   emp_length  = as.numeric(case_when(emp_length == "10+ " ~ "10",
+                                           emp_length == "< 1 " ~ "0.5",
+                                           emp_length == "n/a" ~ "0",
+                                           TRUE ~ as.character(emp_length))))
+                                          
+
+
+
+emp_length_bar = ggplot(data=LC.data, aes(y = emp_length, fill= loan_status))+geom_bar(position = "fill") + theme(legend.position = "top")
+
+```
+
+## Quantitive futures correlation
+```{r}
+anyNA(LC.data)
+# check correlation between all quantitive futures
+loanQuanCorr = cor(LC.data %>% select_if(is.numeric))
+corrplot(loanQuanCorr, order ='hclust',type="upper", tl.cex = 0.8)
+(highCorr = findCorrelation(loanQuanCorr, 0.7, verbose=T, names =T))
+
+# remove features that  correlation greater than 0.7 
+
+LC.data = LC.data %>% select(-c(pub_rec, revol_util, bc_util, sub_grade, total_acc))
+
+```
+
+remove pub_rec, revol_util, bc_util, sub_grade, total_acc
+
+## Quantitive futures visuallization
+
+### checking numeric features
+#### Loan_amount
+```{r}
+Loan_amount_den=ggplot(data=LC.data) + geom_density(mapping= aes(x = loan_amnt,fill=loan_status), alpha=0.7) + theme(legend.position = "top")
+loan_amount_box = ggplot(data=LC.data, aes( x=loan_status, y=loan_amnt,)) + geom_boxplot()
+figure.4 <- grid.arrange( Loan_amount_den,loan_amount_box,  ncol = 2)
+```
+Charged_off customer usually have higher loan amount.
+
+#### interest rate
+```{r}
+int_rate_den = ggplot(data=LC.data) + geom_density(mapping= aes(x = int_rate,fill=loan_status), alpha =0.7)
+int_rate_box = ggplot(data=LC.data, aes( x=loan_status, y=int_rate,)) + geom_boxplot()
+figure.5 <- grid.arrange( int_rate_den,int_rate_box,  ncol = 2)
+
+# there are few outliers for customer who fully paid
+LC.data = LC.data %>% filter(int_rate <=0.3 )
+
+```
+
+higher interest rate loan have higher chance turn into charged off loan.   
+There are few outliers, remove it. 
+
+
+#### annual income
+```{r}
+annual_inc_den = ggplot(data=LC.data) + geom_density(mapping= aes(x = annual_inc,fill=loan_status), alpha =0.7)+ theme(legend.position = "top")
+annual_inc_box = ggplot(data=LC.data, aes( x=loan_status, y=annual_inc,)) + geom_boxplot()
+figure.income <- grid.arrange( annual_inc_den,annual_inc_box,  ncol = 2)
+
+summary(LC.data$annual_inc)
+quantile(LC.data$annual_inc,c(0.95, 0.975))
+#  lots of outliers, remove top 2.5% customer
+LC.data = LC.data %>% filter(annual_inc < 189000  )
+
+# After remove outliers
+inc_den = ggplot(data=LC.data) + geom_density(mapping= aes(x = annual_inc,fill=loan_status), alpha =0.7)+ theme(legend.position = "top")
+inc_box = ggplot(data=LC.data, aes( x=loan_status, y=annual_inc,)) + geom_boxplot() + ggtitle("After Remove Annual Income Outlier")
+figure.income_after <- grid.arrange( inc_den,inc_box,  ncol = 2) 
+
+
+```
+
+There are few outliers, annual income is over millions, I remove top 5% quantile of annua income
+Higher income customer may have slightly higher chance paid off the loan
+
+#### dti 
+A ratio calculated using the borrower’s total monthly debt payments on the total debt obligations, excluding mortgage and the requested LC loan, divided by the borrower’s self-reported monthly income.
+```{r}
+dti_den = ggplot(data=LC.data) + geom_density(mapping= aes(x = dti,fill=loan_status), alpha=.5)+ theme(legend.position = "top")
+dti_box = ggplot(data=LC.data, aes( x=loan_status, y=dti,)) + geom_boxplot()
+figure.7 <- grid.arrange( dti_den,dti_box,  ncol = 2)
+
+```
+
+Charged Off customer usually have higher dti 
+
+#### all_util
+Balance to credit limit on all trades
+```{r}
+all_util_bar = ggplot(data=LC.data) + geom_density(mapping= aes(x = all_util,fill=loan_status), alpha=0.7)+ theme(legend.position = "top")
+all_util_box = ggplot(data=LC.data, aes( x=loan_status, y=all_util,)) + geom_boxplot()
+figure.8 <- grid.arrange( all_util_bar,all_util_box,  ncol = 2)
+
+summary(LC.data$all_util)
+quantile(LC.data$all_util, 0.975)
+#LC.data = LC.data %>% filter (all_util<=1.2)
+
+```
+
+
+#### fico_score
+```{r}
+fico_density =ggplot(data=LC.data) + geom_density(mapping= aes(x = fico_score,fill=loan_status), alpha = 0.5)+ theme(legend.position = "top")
+fico_box =ggplot(data=LC.data, aes( x= loan_status, y=fico_score,)) + geom_boxplot() 
+figure.fico<- grid.arrange( fico_density,fico_box,  ncol = 2)
+
+```
+
+####cr_year
+year of borrower's earliest reported credit line was opened 
+```{r}
+cr_density=ggplot(data=LC.data) + geom_density(mapping= aes(x = cr_year,fill=loan_status), alpha = 0.5)+ theme(legend.position = "top")
+cr_box =ggplot(data=LC.data, aes( x= loan_status, y=cr_year,)) + geom_boxplot() 
+figure.fico<- grid.arrange( cr_density,cr_box,  ncol = 2)
+summary(LC.data$cr_year)
+quantile(LC.data$cr_year, 0.975)
+LC.data = LC.data %>% filter(LC.data$cr_year<=50)
+
+```
+
+##percent_bc_gt_75
+```{r}
+bc_gt_75_density =ggplot(data=LC.data) + geom_density(mapping= aes(x = percent_bc_gt_75,fill=loan_status), position="dodge", alpha=0.7)+ theme(legend.position = "top")
+bc_gt_75_box =ggplot(data=LC.data, aes( x= loan_status, y=percent_bc_gt_75,)) + geom_boxplot() 
+
+figure.bc_gt_75 <- grid.arrange( bc_gt_75_density,bc_gt_75_box,  ncol = 2)
+```
+
+
+# open_acc
+```{r}
+
+open_acc.density = ggplot(data=LC.data) + geom_density(mapping= aes(x = open_acc,fill=loan_status), alpha=.5)+ theme(legend.position = "top")
+open_acc.box = ggplot(data=LC.data, aes(x = loan_status, y= open_acc)) + geom_boxplot()
+figure.open_acc=grid.arrange( open_acc.density,open_acc.box,  ncol = 2)
+summary(LC.data$open_acc)
+quantile(LC.data$open_acc, .975)
+# remove top 5% quantile open_acc
+LC.data = LC.data%>%filter(open_acc<=27)
+```
+
+#### num_actv_rev_tl
+```{r}
+num_actv.density = ggplot(data=LC.data) + geom_bar(mapping= aes(x = num_actv_rev_tl,fill=loan_status), position="dodge")+ theme(legend.position = "top")
+num_actv.box = ggplot(data=LC.data, aes(x = loan_status, y= num_actv_rev_tl)) + geom_boxplot()
+figure.actv=grid.arrange( num_actv.density,num_actv.box,  ncol = 2)
+
+plot(LC$open_acc, LC$num_actv_rev_tl)
+```
+We can remove open_acc 
+
+
+###delinq_2yrs
+The number of 30+ days past-due incidences of delinquency in the borrower's credit file for the past 2 years
+```{r}
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = delinq_2yrs, fill=loan_status), position="dodge")
+# group more than 1 delinquency into one group
+LC.data = LC.data %>% mutate(delinq_2yrs = case_when(delinq_2yrs >=1 ~ 1,
+                                                      delinq_2yrs ==0 ~ 0))
+
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = delinq_2yrs, fill=loan_status), position="fill") + ggtitle("deling_2yrs After Grouping")
+
+```
+
+After grouping , there is no pattern that number of delinquency for the past 2 year would impact the prediction.
+
+
+##inq_last_6mths
+The number of inquiries in past 6 months (excluding auto and mortgage inquiries)
+```{r}
+#inq_last_6mths
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = inq_last_6mths,fill=loan_status), position = "dodge")+ theme(legend.position = "top")
+
+LC.data= LC.data %>% mutate(inq_last_6mths = case_when(inq_last_6mths >=1 ~ 1,
+                                                       inq_last_6mths ==0 ~ 0))
+
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = inq_last_6mths,fill=loan_status), position ="fill")+ theme(legend.position = "top")
+```
+
+## pub_rec_bankruptcies
+Number of derogatory public records
+```{r}
+
+ggplot(data=LC.data) + geom_histogram(mapping= aes(x = pub_rec_bankruptcies,fill=loan_status), position="dodge")+ theme(legend.position = "top")
+
+LC.data= LC.data %>% mutate(pub_rec_bankruptcies = case_when(pub_rec_bankruptcies >=1 ~ 1,
+                                                             pub_rec_bankruptcies ==0 ~ 0))
+
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = pub_rec_bankruptcies,fill=loan_status), position ="fill") + ggtitle("After Grouping (pub_rec_bankruptcies)")
+
+
+
+```
+
+pub_rec is not important.   
+
+
+#### mort_acc
+
+Number of mortgage accounts.
+```{r}
+mort_bar=ggplot(data=LC.data) + geom_bar(mapping= aes(x = mort_acc,fill=loan_status), postiion="dodge")+ theme(legend.position = "top")
+mort_box=ggplot(data=LC.data, aes( x= loan_status, y=mort_acc,)) + geom_boxplot() 
+mort_ownship_box =ggplot(data=LC.data, aes( x =home_ownership, y=mort_acc,fill=loan_status)) + geom_boxplot(position ="dodge")
+figure.mort_acc <- grid.arrange( mort_bar,mort_box, mort_ownship_box, ncol = 2)
+
+
+# remove mort_acc greater than 8
+summary(LC.data$mort_acc)
+quantile(LC.data$mort_acc, 0.95)
+
+#LC.data = LC.data %>% filter(LC.data$mort_acc<8)
+
+```
+
+##num_accts_ever_120_pd
+Number of accounts ever 120 or more days past due
+```{r}
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = num_accts_ever_120_pd,fill=loan_status))+ theme(legend.position = "top")
+
+LC.data= LC.data %>% mutate(num_accts_ever_120_pd = case_when(num_accts_ever_120_pd >=1 ~ 1,
+                                                              num_accts_ever_120_pd <1 ~ 0))
+
+ggplot(data=LC.data) + geom_bar(mapping= aes(x = num_accts_ever_120_pd,fill=loan_status), position ="fill")+ theme(legend.position = "top")
+```
+
+
+
+## num_tl_op_past_12m
+Number of accounts opened in past 12 months
+```{r}
+tl_open_12m_bar =ggplot(data=LC.data) + geom_bar(mapping= aes(x = num_tl_op_past_12m,fill=loan_status), position="dodge")+ theme(legend.position = "top")
+tl_open_12m_box = ggplot(data=LC.data, aes( x= loan_status, y=num_tl_op_past_12m,)) + geom_boxplot() 
+
+figure.tl_open <- grid.arrange( tl_open_12m_bar,tl_open_12m_box, ncol = 2)
+LC.data = LC.data %>% filter(num_tl_op_past_12m <= 10)
+
+
+```
+#### remove unrelated features
+```{r}
+LC.data = LC.data %>% select(-c(open_acc, delinq_2yrs, inq_last_6mths, pub_rec_bankruptcies))
+```
+
+
+
+
+# check correlation again
+```{r}
+loanQuanCorr = cor(LC.data %>% select_if(is.numeric))
+corrplot(loanQuanCorr, order ='hclust',type="upper", tl.cex = 0.8)
+(highCorr = findCorrelation(loanQuanCorr, 0.7, verbose=T, names =T))
+```
+

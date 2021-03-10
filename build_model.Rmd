@@ -1,0 +1,329 @@
+---
+title: "Build_Models"
+author: "Huiting Sheng"
+date: "3/3/2021"
+output: html_document
+---
+# Loading Data
+```{r}
+load("Cleaned_data.RData")
+```
+
+# Installing/Loading Packages
+```{r Load_package, message=F}
+packages=c("caret","ggplot2", "tidyverse", "dplyr", "corrplot","e1071", "reshape2","lubridate","usmap", "glmnet", "pROC","doParallel", "ranger","lattice","gridExtra", "kableExtra", "ROSE", "DMwR","precrec")
+# Now load or install & load all
+package.check <- lapply(packages,FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+```
+
+
+
+
+#Covert facotr to dummy variable and checking the skewnes. 
+
+```{r}
+## checking data type and missing record
+table(sapply(LC.data[1,], class))
+anyNA(LC.data)
+
+LC.data %>%select_if(is.numeric)%>%colnames
+LC.data$num_accts_ever_120_pd = as.factor(LC.data$num_accts_ever_120_pd)
+# Separate data set into numeric and factor. 
+loanFactor = LC.data %>%select_if(is.factor) %>% select(-loan_status)
+loanQuan = LC.data %>% select_if(is.numeric)
+
+# Convert factor into dummy variables
+dummyModel        = dummyVars(~ ., data = loanFactor, fullRank = TRUE) 
+loanFactorDummy   = predict(dummyModel, loanFactor)
+loanFactorDummy   = as_tibble(loanFactorDummy)
+
+# checking skewness
+skewnessVec = loanQuan %>% sapply(., skewness)
+names(loanQuan)[abs(skewnessVec) > 2]
+
+
+# not going to correct the skewness of delinq_2yrs and pub_rec_bankruptcies
+X = cbind(loanQuan, loanFactorDummy)
+
+# Separate Y
+Y = LC.data$loan_status%>%unlist()
+
+# Charged Off is the one we are interested, set it as event. 
+YRelevel = relevel(Y,ref = 'Charged_off')
+
+
+
+```
+
+# Split Data
+## split data with dummy variable into training set and test set
+
+```{r split data, cache = T}
+set.seed(1)
+trainIndex =createDataPartition(Y, p = 0.8, list = FALSE)
+Xtrain = X[trainIndex,] 
+Xtest  = X[-trainIndex,]
+Ytrain = Y[trainIndex]
+Ytest  = Y[-trainIndex]
+```
+
+
+## split original data into training set and test set
+
+```{r split data, cache = T}
+set.seed(1)
+trainIndex =createDataPartition(Y, p = 0.8, list = FALSE)
+Xtrain_wo_dummy = LC.data[trainIndex,]%>%select(-loan_status) 
+Xtest_wo_dummy  = LC.data[-trainIndex,]%>%select(-loan_status) 
+Ytrain_wo_dummy = LC.data[trainIndex]
+Ytest_wo_dummy  = LC.data[-trainIndex]
+```
+
+
+# Building Model
+
+## register the parallel backend and 
+```{r}
+cl=makeCluster(6)
+registerDoParallel(cl)
+```
+
+## Generalized Linear Models
+```{r GLM}
+set.seed(2)
+trainControl = trainControl(method = "cv", number = 10, sampling = "down", allowParalle = T )
+
+glm.Out = train(x = Xtrain, 
+                y = Ytrain, 
+                method = "glm",
+                preProcess = c("center", "scale"),
+                trControl = trainControl)
+
+
+```
+
+## Generalized Linear Models with penalization (Elastic Net)
+```{r elastic_net, cache =T}
+tune.grid = expand.grid(alpha  = seq(0,1, 0.1),lambda = seq(1e-5, 1e-2, length = 10))
+                              
+elasticnet.Out = train(x = Xtrain, 
+                   y = Ytrain, 
+                   method = "glmnet", 
+                   preProcessing =c("center", "scale"),
+                   trControl = trainControl,
+                   tuneGrid=tune.grid)
+
+elasticnet.Out$bestTune
+
+plot(elasticnet.Out, xlab="alpha", ylab= "K-fold CV", main="Accuracy")
+
+```
+
+
+
+## eXtreme Gradient Boosting with Accuracy
+```{r boosting with accracy, cache=T}
+cl <- makeCluster(6)
+registerDoParallel(cl)
+tuneGrid = data.frame('nrounds' = seq(3000, 5000, length.out = 10),
+                      'max_depth' = 3,
+                      'eta' = 0.01,
+                      'gamma' = 0,
+                      'colsample_bytree' = 1,
+                      'min_child_weight' = 0,
+                      'subsample' = 0.5)
+
+XGboost.Out = train(x = Xtrain, 
+                 y = Ytrain,
+                 method = 'xgbTree',
+                 tuneGrid = tuneGrid,
+                 metric = 'Accuracy',
+                 trControl = trainControl)
+plot(XGboost.Out)
+
+```
+
+### eXtreme Gradient Boosting with kappa
+```{r boosting with kappa}
+cl <- makeCluster(6)
+registerDoParallel(cl)
+set.seed(1)
+# Adjusting nrounds and max_depth to find the best tuneGrid
+tuneGrid = data.frame('nrounds' = seq(2000, 5000, length.out = 10),
+                      'max_depth' = 3,
+                      'eta' = 0.01,
+                      'gamma' = 0,
+                      'colsample_bytree' = 1,
+                      'min_child_weight' = 0,
+                      'subsample' = 0.5)
+
+XGboost.kappa.Out   = train(x = Xtrain, y = relevel(Ytrain, ref = 'Charged_off'),
+                     method = 'xgbTree', 
+                     tuneGrid = tuneGrid,
+                     metric = 'Kappa',
+                     trControl = trainControl)
+
+plot(XGboost.kappa.Out)
+```
+
+## Classification And Regression Trees (CART)
+```{r}
+cl <- makeCluster(6)
+registerDoParallel(cl)
+trainControl = trainControl(method = "cv", number = 10, sampling = "down", allowParalle = T )
+tuneGrid = expand.grid(cp = c(0, 0.0001,0.001, 0.01, 0.1, 0.5, 1))
+#Recursive Partitioning And Regression Trees
+rpart.Out = train(x = Xtrain_wo_dummy, y = Ytrain,
+                  method = "rpart",
+                  tuneGrid = tuneGrid,
+                  trControl = trainControl)
+plot(rpart.Out$results$cp, rpart.Out$results$Accuracy, type="l", col="blue")
+plot(rpart.Out$finalModel)
+text(rpart.Out$finalModel, cex = 0.4, digits = 1)
+
+```
+
+## Random Forest
+```{r}
+tuneGridRanger = data.frame(splitrule = 'gini',
+                            min.node.size=1,
+                            mtry = round(sqrt(ncol(Xtrain)))
+                            )
+
+ranger.Out      = train(x = Xtrain, 
+                   y = Ytrain,
+                   method = "ranger",
+                   tuneGrid = tuneGridRanger,
+                   num.trees=1000,
+                   importance = "impurity",
+                   trControl = trainControl)
+stopCluster(cl)
+```
+
+## KNN (k- Nearest Neighbors)
+
+```{r}
+tuneGrid = data.frame(k=c(5,10,20,50))
+
+knn.Out      = train(x = Xtrain, 
+                   y = Ytrain,
+                   method = "knn",
+                   tuneGrid = tuneGrid,
+                   trControl = trainControl)
+plot(knn.Out)
+```
+
+## SVM (Support Vector Machine)
+
+```{r}
+tuneGrid= data.frame("cost"= ,
+                      "weight" =)
+
+svm.Out      = train(x = Xtrain, 
+                   y = Ytrain,
+                   method = "svmLinearWeights",
+                   tuneGrid = tuneGrid,
+                   trControl = trainControl)
+plot(svm.Out)
+
+
+```
+
+
+
+
+
+
+# Testing and Comparing the model performance
+```{r}
+# glm performance
+YHatTest.glm = predict(glm.Out, Xtest,  type="prob")
+glm.roc = roc(Ytest,YHatTest.glm[,1], levels = c("Fully_Paid", "Charged_off"))
+glm.auc = glm.roc$auc
+
+# Elastic Net performance
+YHatTest.elasticnet = predict(elasticnet.Out, Xtest,  type="prob")
+elasticnet.roc = roc(Ytest,YHatTest.elasticnet[,1], levels = c("Fully_Paid", "Charged_off"))
+elasticnet.auc = elasticnet.roc$auc
+  
+# eXtreme Gradient Boosting performance
+YHatTest.XGBoost = predict(XGboost.Out, Xtest,  type="prob")
+XGBoost.roc = roc(Ytest,YHatTest.XGBoost[,1], levels = c("Fully_Paid", "Charged_off"))
+XGBoost.auc = XGBoost.roc$auc
+
+# eXtreme Gradient Boosting with kappa performance  
+YHatTest.XGBoost.kappa = predict(XGboost.kappa.Out, Xtest,  type="prob")
+XGBoost.kappa.roc = roc(Ytest,YHatTest.XGBoost.kappa[,1], levels = c("Fully_Paid", "Charged_off"))
+XGBoost.kappa.auc = XGBoost.kappa.roc$auc
+
+# CART performance
+YHatTest.CART = predict(rpart.Out, Xtest_wo_dummy,  type="prob")
+CART.roc = roc(Ytest,YHatTest.CART[,1], levels = c("Fully_Paid", "Charged_off"))
+CART.auc = CART.roc$auc
+
+# Random Forest performance
+YHatTest.ranger = predict(ranger.Out, Xtest,  type="prob")
+ranger.roc = roc(Ytest,YHatTest.ranger[,1], levels = c("Fully_Paid", "Charged_off"))
+ranger.auc = ranger.roc$auc
+
+
+# put the auc together
+auc = data.frame(names = c("glm", "elastic_net", "XGBoost", "XGBoost_kappa", "CART" ),
+                 auc = c(glm.auc,elasticnet.auc, XGBoost.auc,XGBoost.kappa.auc,CART.auc ))
+print(auc)
+# visualise auc of different models
+plot(auc, type="p")
+```
+
+```{r}
+plot(glm.roc, legacy.axes = TRUE, main = "GLM ROC Curve", col="black")
+lines(elasticnet.roc, legacy.axes = TRUE, main = "GLM with Penalty", col="red")
+lines(XGBoost.roc,legacy.axes = TRUE, main = "XGBoost ROC Curve", col="blue")
+lines(CART.roc,legacy.axes = TRUE, main = "CART ROC Curve", col="green")
+legend("topleft", col=c("black", "red", "blue", "green"), lty=1,legend=c(" GLM", "Elastic Net", "XGBoost","CART"))
+```
+
+
+
+
+
+# Boosting model Tuning
+Boosting model have the best performance
+
+```{r}
+plot(XGBoost.roc, print.thres = c(0.1,0.2,0.3, 0.4,0.5))
+
+
+YhatTest1 = ifelse(YHatTest.XGBoost[,1] > 0., "Charged_off","Fully_Paid") %>% as.factor
+confusionMatrix(YhatTest1, relevel(Ytest, ref ="Charged_off"))
+
+XGBoost.roc$thresholds[which.max(sqrt(XGBoost.roc$sensitivities +XGBoost.roc$specificities-1))]
+```
+
+```{r}
+cl <- makeCluster(6)
+registerDoParallel(cl)
+tuneGrid = data.frame('nrounds' = seq(3000, 5000, length.out = 10),
+                      'max_depth' = 5,
+                      'eta' = 0.01,
+                      'gamma' = 0,
+                      'colsample_bytree' = 1,
+                      'min_child_weight' = 1,
+                      'subsample' = 0.8)
+
+XGboost.Out = train(x = Xtrain, 
+                 y = Ytrain,
+                 method = 'xgbTree',
+                 tuneGrid = tuneGrid,
+                 metric = 'auc',
+                 trControl = trainControl)
+plot(XGboost.Out)
+
+```
+
